@@ -1,0 +1,153 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Cabinet preview</title>
+<style>html,body{margin:0;background:#d9d9db;overflow:hidden}</style>
+<script type="importmap">{"imports":{"three":"/node_modules/three/build/three.module.js","three/addons/":"/node_modules/three/examples/jsm/"}}</script>
+</head><body>
+<script type="module">
+// Approximation du rendu Roblox à partir de scene.json (produit par run.js).
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+const params = new URLSearchParams(location.search);
+const W = +params.get('w') || 1024, H = +params.get('h') || 576;
+const scene = await (await fetch(params.get('scene'))).json();
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setSize(W, H); renderer.setPixelRatio(1);
+renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.05;
+document.body.appendChild(renderer.domElement);
+
+const s = new THREE.Scene();
+s.background = new THREE.Color(0xd9d9db);
+const pmrem = new THREE.PMREMGenerator(renderer);
+s.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+s.add(new THREE.HemisphereLight(0xffffff, 0x8a8a8a, 0.75));
+const sun = new THREE.DirectionalLight(0xffffff, 1.5);
+sun.position.set(-14, 22, -10); sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -25, right: 25, top: 25, bottom: -25, near: 1, far: 80 });
+s.add(sun);
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), new THREE.MeshStandardMaterial({ color: 0xd9d9db, roughness: 1 }));
+floor.rotation.x = -Math.PI / 2; floor.receiveShadow = true; s.add(floor);
+
+const col = c => new THREE.Color().setRGB(c[0], c[1], c[2], THREE.SRGBColorSpace);
+const matrixOf = cf => new THREE.Matrix4().set(
+  cf.R[0], cf.R[1], cf.R[2], cf.p[0], cf.R[3], cf.R[4], cf.R[5], cf.p[1], cf.R[6], cf.R[7], cf.R[8], cf.p[2], 0, 0, 0, 1);
+
+function wedgeGeometry(sx, sy, sz) {
+  const w = sx / 2, h = sy / 2, d = sz / 2;
+  const A = [-w, -h, -d], B = [w, -h, -d], C = [-w, -h, d], D = [w, -h, d], E = [-w, h, d], F = [w, h, d];
+  const tris = [A, C, D, A, D, B, C, E, F, C, F, D, A, B, F, A, F, E, A, E, C, B, D, F];
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(tris.flat(), 3));
+  g.computeVertexNormals();
+  return g;
+}
+
+function guiTexture(part) {
+  const g = part.gui, pps = g.ppS;
+  const cw = Math.round(part.size[0] * pps), ch = Math.round(part.size[1] * pps);
+  const k = 4; // sur-échantillonnage
+  const cv = document.createElement('canvas'); cv.width = cw * k; cv.height = ch * k;
+  const ctx = cv.getContext('2d'); ctx.scale(k, k);
+  const draw = (n, px, py, pw, ph) => {
+    for (const c of n.children) {
+      const x = px + c.pos[0] * pw + c.pos[1], y = py + c.pos[2] * ph + c.pos[3];
+      const w = c.size[0] * pw + c.size[1], h = c.size[2] * ph + c.size[3];
+      if (c.bgT < 1) { ctx.globalAlpha = 1 - c.bgT; ctx.fillStyle = '#' + col(c.bg).getHexString(THREE.SRGBColorSpace); ctx.fillRect(x, y, w, h); ctx.globalAlpha = 1; }
+      if (c.text) { ctx.fillStyle = '#' + col(c.textColor).getHexString(THREE.SRGBColorSpace); ctx.font = `bold ${h * 0.8}px monospace`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(c.text, x + w / 2, y + h / 2, w); }
+      draw(c, x, y, w, h);
+    }
+  };
+  ctx.beginPath(); ctx.rect(0, 0, cw, ch); ctx.clip();
+  // dessine par ZIndex : d'abord fonds, le texte (z=2) à la fin
+  draw({ children: g.children.map(d => ({ ...d, children: d.children.filter(c => c.z < 2) })) }, 0, 0, cw, ch);
+  draw({ children: g.children.map(d => ({ ...d, bgT: 1, children: d.children.filter(c => c.z >= 2) })) }, 0, 0, cw, ch);
+  const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace; return t;
+}
+
+function materialFor(p) {
+  const c = col(p.color);
+  switch (p.material) {
+    case 'Neon': return new THREE.MeshBasicMaterial({ color: c.clone().multiplyScalar(3.2) });
+    case 'Metal': return new THREE.MeshStandardMaterial({ color: c, metalness: 0.55, roughness: 0.3 });
+    case 'Foil': return new THREE.MeshStandardMaterial({ color: c, metalness: 0.9, roughness: 0.32 });
+    case 'Glass': return new THREE.MeshStandardMaterial({ color: c, metalness: 0.1, roughness: 0.08 });
+    default: return new THREE.MeshStandardMaterial({ color: c, roughness: 0.55, metalness: Math.min(0.6, p.reflectance * 2.5) });
+  }
+}
+
+const onlyCab = params.get('only');
+for (const it of scene.items) {
+  if (onlyCab && it.cab !== onlyCab) continue;
+  if (it.kind === 'part') {
+    if (it.transparency >= 1) continue;
+    let geo;
+    if (it.class === 'WedgePart') geo = wedgeGeometry(...it.size);
+    else if (it.shape === 'Ball') geo = new THREE.SphereGeometry(Math.min(...it.size) / 2, 24, 16);
+    else if (it.shape === 'Cylinder') { geo = new THREE.CylinderGeometry(Math.min(it.size[1], it.size[2]) / 2, Math.min(it.size[1], it.size[2]) / 2, it.size[0], 24); geo.rotateZ(Math.PI / 2); }
+    else geo = new THREE.BoxGeometry(...it.size);
+    let mat = materialFor(it);
+    if (it.gui) {
+      const tex = guiTexture(it);
+      const front = new THREE.MeshStandardMaterial({ map: tex, emissiveMap: tex, emissive: 0xffffff, emissiveIntensity: 1.4, roughness: 0.15 });
+      mat = [mat, mat, mat, mat, mat, front];
+    }
+    const m = new THREE.Mesh(geo, mat);
+    m.matrixAutoUpdate = false; m.matrix.copy(matrixOf(it.cf));
+    m.castShadow = it.material !== 'Neon'; m.receiveShadow = true;
+    s.add(m);
+  } else if (it.kind === 'PointLight') {
+    const l = new THREE.PointLight(col(it.color), it.brightness * 6, it.range, 1.5);
+    l.position.set(...it.pos); l.position.z -= 0.6; s.add(l);
+  } else if (it.kind === 'SurfaceLight') {
+    const l = new THREE.SpotLight(col(it.color), it.brightness * 8, it.range, Math.PI / 3, 0.6, 1.5);
+    const mtx = matrixOf(it.cf); l.position.setFromMatrixPosition(mtx);
+    const dir = new THREE.Vector3(-it.cf.R[2], -it.cf.R[5], -it.cf.R[8]);
+    l.target.position.copy(l.position).add(dir.multiplyScalar(4)); s.add(l); s.add(l.target);
+  } else if (it.kind === 'emitter') {
+    // Approximation statique : nuage de sprites
+    const n = it.name === 'Aura' ? 70 : 34, pts = [], cols = [];
+    let rnd = 1; const R = () => (rnd = (rnd * 16807) % 2147483647) / 2147483647;
+    for (let i = 0; i < n; i++) {
+      let v;
+      if (it.pos) { const a = R() * Math.PI * 2, r = R() * 1.4, up = R() * 1.6; v = new THREE.Vector3(it.pos[0] + Math.cos(a) * r, it.pos[1] + up - 0.2, it.pos[2] + Math.sin(a) * r); }
+      else { const face = Math.floor(R() * 4), u = R() - 0.5, h = R() - 0.5, sx = it.size[0] / 2 + 0.2, sz = it.size[2] / 2 + 0.2;
+        const lx = face < 2 ? (face ? sx : -sx) : u * 2 * sx, lz = face < 2 ? u * 2 * sz : (face === 2 ? sz : -sz);
+        v = new THREE.Vector3(lx, h * it.size[1], lz).applyMatrix4(matrixOf(it.cf)); }
+      pts.push(v.x, v.y, v.z);
+      const k = it.colors[Math.floor(R() * it.colors.length)].c; cols.push(...col(k).toArray());
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3)); g.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+    s.add(new THREE.Points(g, new THREE.PointsMaterial({ size: it.name === 'Aura' ? 0.22 : 0.16, vertexColors: true, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true })));
+  } else if (it.kind === 'beam') {
+    const P0 = new THREE.Vector3(...it.p0), P3 = new THREE.Vector3(...it.p1);
+    const P1 = P0.clone().addScaledVector(new THREE.Vector3(...it.ax0), it.c0);
+    const P2 = P3.clone().addScaledVector(new THREE.Vector3(...it.ax1), -it.c1);
+    const curve = new THREE.CubicBezierCurve3(P0, P1, P2, P3);
+    const tub = 40, rad = 6, g = new THREE.TubeGeometry(curve, tub, it.width / 2, rad, false);
+    const cols = [], cnt = g.attributes.position.count;
+    const seq = it.colors;
+    const at = t => { for (let i = 0; i < seq.length - 1; i++) if (t <= seq[i + 1].t) { const f = (t - seq[i].t) / (seq[i + 1].t - seq[i].t); return col(seq[i].c).lerp(col(seq[i + 1].c), f); } return col(seq[seq.length - 1].c); };
+    for (let v = 0; v < cnt; v++) cols.push(...at(Math.floor(v / (rad + 1)) / tub).multiplyScalar(1.8).toArray());
+    g.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+    s.add(new THREE.Mesh(g, new THREE.MeshBasicMaterial({ vertexColors: true })));
+  }
+}
+
+const cam = new THREE.PerspectiveCamera(+params.get('fov') || 30, W / H, 0.1, 500);
+const [cx, cy, cz, tx, ty, tz] = params.get('cam').split(',').map(Number);
+cam.position.set(cx, cy, cz); cam.lookAt(tx, ty, tz);
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(s, cam));
+composer.addPass(new UnrealBloomPass(new THREE.Vector2(W, H), 0.6, 0.4, 1.25));
+composer.addPass(new OutputPass());
+composer.render();
+window.__done = true;
+</script></body></html>
